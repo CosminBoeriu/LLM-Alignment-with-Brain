@@ -3,25 +3,15 @@ import glob
 import torch
 import numpy as np
 import pandas as pd
+import argparse
 from PIL import Image
 from tqdm import tqdm
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import KFold
-from scipy.stats import pearsonr
-from transformers import AutoTokenizer, AutoModel, CLIPProcessor, CLIPModel, CLIPVisionModel
-
-# ================= Configuration =================
-SUBJECT = "M01"
-# Choose one: "sentences", "word_clouds", "pictures"
-PARADIGM = "word_clouds"
-
-DATA_ROOT = "./data"
-IMAGE_DIR = "./Pereira_Materials/IARPA_expt1_stim_images"
-STIMULI_DIR = "./data/stimuli"  # Where your CSVs are
+from transformers import AutoTokenizer, AutoModel, CLIPProcessor, CLIPVisionModel
 
 
-# =============================================
-
+# ================= Feature Extractors =================
 class TextFeatureExtractor:
     def __init__(self, model_name="gpt2-xl", layer=-1, device="cuda"):
         print(f"Loading Text Model: {model_name}...")
@@ -43,15 +33,12 @@ class TextFeatureExtractor:
                 self.device)
             with torch.no_grad():
                 outputs = self.model(**inputs)
-
             hidden_states = outputs.hidden_states[self.layer]
-            # Extract last token (EOS) for representation
             if self.tokenizer.padding_side == "left":
                 batch_embeddings = hidden_states[:, -1, :]
             else:
                 last_token_idxs = inputs.attention_mask.sum(dim=1) - 1
                 batch_embeddings = hidden_states[torch.arange(hidden_states.size(0)), last_token_idxs]
-
             embeddings.append(batch_embeddings.cpu().numpy())
         return np.vstack(embeddings)
 
@@ -77,7 +64,6 @@ class VisionFeatureExtractor:
                 except:
                     print(f"Skipping {p}")
             if not images: continue
-
             inputs = self.processor(images=images, return_tensors="pt").to(self.device)
             with torch.no_grad():
                 outputs = self.model(**inputs)
@@ -85,11 +71,16 @@ class VisionFeatureExtractor:
         return np.vstack(embeddings)
 
 
-def run_experiment():
-    print(f"\n--- 🧠 Running Experiment: {SUBJECT} - {PARADIGM} ---")
+# ================= Main Logic =================
+def run_experiment(subject, paradigm, data_root, stimuli_dir, image_dir, results_dir):
+    print(f"\n--- 🧠 Running Experiment: {subject} - {paradigm} ---")
 
-    # 1. Load Brain Data
-    brain_file = os.path.join(DATA_ROOT, "fMRI", f"{SUBJECT}_{PARADIGM}_betas.npy")
+    # 1. Load Brain Data (Look in subject subfolder first, then root)
+    brain_file = os.path.join(data_root, "fMRI", subject, f"{subject}_{paradigm}_betas.npy")
+    if not os.path.exists(brain_file):
+        # Fallback to old flat structure if subfolder missing
+        brain_file = os.path.join(data_root, "fMRI", f"{subject}_{paradigm}_betas.npy")
+
     if not os.path.exists(brain_file):
         print(f"❌ Brain data missing: {brain_file}\nRun preprocess_brain_data.py first.")
         return
@@ -97,30 +88,22 @@ def run_experiment():
     print(f"Loaded Brain Data: {brain_data.shape}")
 
     # 2. Extract Features
-    if PARADIGM in ["sentences", "word_clouds"]:
-        # --- TEXT FLOW ---
-        # Look for stimuli csv
-        stim_file = os.path.join(STIMULI_DIR, f"stimuli_order_{SUBJECT}_{PARADIGM}.csv")
-
-        # Fallback: If no CSV, look for raw text files in Pereira Materials if available
-        # But usually you need to construct the CSV first.
+    if paradigm in ["sentences", "word_clouds"]:
+        stim_file = os.path.join(stimuli_dir, f"stimuli_order_{subject}_{paradigm}.csv")
         if not os.path.exists(stim_file):
-            print(f"❌ Stimuli CSV missing: {stim_file}")
-            # DUMMY FALLBACK for demonstration if you don't have the CSV yet
-            print("⚠️ Generating dummy text data for testing flow...")
+            print(f"⚠️ Stimuli CSV missing: {stim_file}. Using dummy text.")
             texts = [f"sample text {i}" for i in range(brain_data.shape[0])]
         else:
             df = pd.read_csv(stim_file)
             texts = df['stimulus'].tolist()
 
-        extractor = TextFeatureExtractor(model_name="gpt2-xl")  # Using GPT2-XL as robust text baseline
+        # Use GPT2-XL for text
+        extractor = TextFeatureExtractor(model_name="gpt2-xl")
         features = extractor.extract(texts)
         model_name = "gpt2-xl"
 
-    elif PARADIGM == "pictures":
-        # --- VISION FLOW ---
-        image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR, "**", "*.jpg"), recursive=True))
-        # Filter hidden files
+    elif paradigm == "pictures":
+        image_paths = sorted(glob.glob(os.path.join(image_dir, "**", "*.jpg"), recursive=True))
         image_paths = [p for p in image_paths if "._" not in p]
 
         # Truncate to match brain data
@@ -132,7 +115,7 @@ def run_experiment():
         features = extractor.extract(image_paths)
         model_name = "clip"
 
-    # 3. Alignment (Ridge Regression)
+    # 3. Alignment
     print(f"Training Ridge Regression ({features.shape[0]} samples)...")
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     predictions = np.zeros_like(brain_data)
@@ -143,21 +126,30 @@ def run_experiment():
         predictions[test_idx] = model.predict(features[test_idx])
 
     # 4. Correlation
-    print("Computing correlations...")
-    # Fast vectorized correlation
     Y_true = brain_data - brain_data.mean(axis=0)
     Y_pred = predictions - predictions.mean(axis=0)
     numer = np.sum(Y_true * Y_pred, axis=0)
     denom = np.sqrt(np.sum(Y_true ** 2, axis=0)) * np.sqrt(np.sum(Y_pred ** 2, axis=0)) + 1e-8
     correlations = numer / denom
 
-    # 5. Save
-    os.makedirs("./results", exist_ok=True)
-    out_file = f"./results/{SUBJECT}_{PARADIGM}_{model_name}_correlations.npy"
+    # 5. Save (Organized in Subject Folder)
+    subject_res_dir = os.path.join(results_dir, subject)
+    os.makedirs(subject_res_dir, exist_ok=True)
+
+    out_file = os.path.join(subject_res_dir, f"{subject}_{paradigm}_{model_name}_correlations.npy")
     np.save(out_file, correlations)
     print(f"✅ Saved results to {out_file}")
     print(f"Mean r: {np.mean(correlations):.4f} | Max r: {np.max(correlations):.4f}")
 
 
 if __name__ == "__main__":
-    run_experiment()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--subject", type=str, default="M01")
+    parser.add_argument("--paradigm", type=str, default="sentences")
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--stimuli_dir", type=str, default="./data/stimuli")
+    parser.add_argument("--image_dir", type=str, default="./Pereira_Materials/IARPA_expt1_stim_images")
+    parser.add_argument("--results_dir", type=str, default="./results")
+    args = parser.parse_args()
+
+    run_experiment(args.subject, args.paradigm, args.data_root, args.stimuli_dir, args.image_dir, args.results_dir)
